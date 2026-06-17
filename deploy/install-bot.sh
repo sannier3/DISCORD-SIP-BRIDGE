@@ -10,8 +10,15 @@ if [[ ${EUID} -ne 0 ]]; then
     exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Avec "curl | bash", BASH_SOURCE[0] est vide : on clone toujours depuis GitHub.
+SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+if [[ -n "${SCRIPT_PATH}" && -f "${SCRIPT_PATH}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+    SOURCE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+else
+    SCRIPT_DIR=""
+    SOURCE_DIR=""
+fi
 CLONE_DIR=""
 
 cleanup() {
@@ -107,10 +114,22 @@ install -o root -g "${SERVICE_USER}" -m 0640 "${SOURCE_DIR}/package.json" "${TAR
 install -o root -g "${SERVICE_USER}" -m 0640 "${SOURCE_DIR}/package-lock.json" "${TARGET_DIR}/package-lock.json"
 
 cd "${TARGET_DIR}"
+NPM_REGISTRY="https://registry.npmjs.org/"
+
+if [[ -f /root/.npmrc ]] && grep -q 'registry=' /root/.npmrc && ! grep -q 'registry.npmjs.org' /root/.npmrc; then
+    log "Registre npm global personnalisé détecté, utilisation forcée de registry.npmjs.org."
+fi
+
+cat > "${TARGET_DIR}/.npmrc" <<EOF
+registry=${NPM_REGISTRY}
+EOF
+chown root:"${SERVICE_USER}" "${TARGET_DIR}/.npmrc"
+chmod 0640 "${TARGET_DIR}/.npmrc"
+
 log "Installation des dépendances npm (compilation audio, 2 à 5 minutes)..."
-npm ci --omit=dev --loglevel=info
+npm_config_registry="${NPM_REGISTRY}" npm ci --omit=dev --loglevel=warn --registry="${NPM_REGISTRY}" --userconfig "${TARGET_DIR}/.npmrc"
 log "Vérification du code..."
-npm run check
+npm_config_registry="${NPM_REGISTRY}" npm run check --registry="${NPM_REGISTRY}" --userconfig "${TARGET_DIR}/.npmrc"
 
 log "Application des permissions..."
 chown -R root:"${SERVICE_USER}" "${TARGET_DIR}"
