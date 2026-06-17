@@ -24,18 +24,52 @@ trap cleanup EXIT
 TARGET_DIR="/opt/discord-sip-bridge"
 SERVICE_USER="discord-sip"
 CREDENTIALS_FILE="/root/discord-asterisk-credentials.txt"
+export DEBIAN_FRONTEND=noninteractive
 
-apt-get update
-apt-get install -y ca-certificates curl git build-essential pkg-config libopus-dev libsodium-dev
+log() {
+    echo "[$(date +%H:%M:%S)] $*"
+}
+
+apt_install() {
+    if command -v debconf-set-selections >/dev/null 2>&1; then
+        echo 'man-db man-db/auto-update boolean false' | debconf-set-selections
+    fi
+
+    log "Mise à jour des paquets système (peut prendre 1 à 3 minutes, man-db ignoré)..."
+    apt-get update -qq
+    apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        "$@"
+}
+
+stop_service_if_running() {
+    if ! systemctl is-active --quiet discord-sip-bridge 2>/dev/null; then
+        return 1
+    fi
+
+    log "Arrêt du service discord-sip-bridge (max. 25 s)..."
+    if timeout 25 systemctl stop discord-sip-bridge; then
+        log "Service arrêté."
+        return 0
+    fi
+
+    log "Arrêt forcé du service..."
+    systemctl kill discord-sip-bridge 2>/dev/null || true
+    timeout 10 systemctl stop discord-sip-bridge 2>/dev/null || true
+    return 0
+}
+
+apt_install ca-certificates curl git build-essential pkg-config libopus-dev libsodium-dev
 
 if [[ ! -f "${SOURCE_DIR}/server.js" ]]; then
-    echo "Téléchargement des sources depuis ${REPO_URL} (branche ${REPO_BRANCH})..."
+    log "Téléchargement des sources depuis ${REPO_URL} (branche ${REPO_BRANCH})..."
     CLONE_DIR="$(mktemp -d)"
     git clone --depth 1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${CLONE_DIR}"
     SOURCE_DIR="${CLONE_DIR}"
     SCRIPT_DIR="${CLONE_DIR}/deploy"
 elif [[ -d "${SOURCE_DIR}/.git" ]]; then
-    echo "Mise à jour des sources locales depuis ${REPO_URL} (branche ${REPO_BRANCH})..."
+    log "Mise à jour des sources locales depuis ${REPO_URL} (branche ${REPO_BRANCH})..."
     git -C "${SOURCE_DIR}" fetch --depth 1 origin "${REPO_BRANCH}"
     git -C "${SOURCE_DIR}" checkout "${REPO_BRANCH}"
     git -C "${SOURCE_DIR}" reset --hard "origin/${REPO_BRANCH}"
@@ -45,33 +79,40 @@ UPDATING=false
 WAS_RUNNING=false
 if [[ -f "${TARGET_DIR}/server.js" ]]; then
     UPDATING=true
-    echo "Mise à jour de l'installation existante dans ${TARGET_DIR}..."
-    if systemctl is-active --quiet discord-sip-bridge 2>/dev/null; then
+    log "Mise à jour de l'installation existante dans ${TARGET_DIR}..."
+    if stop_service_if_running; then
         WAS_RUNNING=true
-        echo "Arrêt temporaire du service discord-sip-bridge..."
-        systemctl stop discord-sip-bridge
     fi
 else
-    echo "Nouvelle installation dans ${TARGET_DIR}..."
+    log "Nouvelle installation dans ${TARGET_DIR}..."
 fi
 
 if ! command -v node >/dev/null 2>&1 || [[ "$(node -p 'Number(process.versions.node.split(".")[0])')" -lt 22 ]]; then
+    log "Installation de Node.js 22 (peut prendre 1 à 2 minutes)..."
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    apt-get install -y nodejs
+    apt_install nodejs
+    log "Node.js $(node -v) installé."
+else
+    log "Node.js $(node -v) déjà présent."
 fi
 
 if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
     useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin "${SERVICE_USER}"
 fi
 
+log "Copie des fichiers de l'application..."
 install -d -o root -g "${SERVICE_USER}" -m 0750 "${TARGET_DIR}"
 install -o root -g "${SERVICE_USER}" -m 0640 "${SOURCE_DIR}/server.js" "${TARGET_DIR}/server.js"
 install -o root -g "${SERVICE_USER}" -m 0640 "${SOURCE_DIR}/package.json" "${TARGET_DIR}/package.json"
 install -o root -g "${SERVICE_USER}" -m 0640 "${SOURCE_DIR}/package-lock.json" "${TARGET_DIR}/package-lock.json"
 
 cd "${TARGET_DIR}"
-npm ci --omit=dev
+log "Installation des dépendances npm (compilation audio, 2 à 5 minutes)..."
+npm ci --omit=dev --loglevel=info
+log "Vérification du code..."
 npm run check
+
+log "Application des permissions..."
 chown -R root:"${SERVICE_USER}" "${TARGET_DIR}"
 find "${TARGET_DIR}/node_modules" -type d -exec chmod 0750 {} +
 find "${TARGET_DIR}/node_modules" -type f -exec chmod 0640 {} +
@@ -92,6 +133,7 @@ if [[ ! -f "${TARGET_DIR}/.env" ]]; then
         PJSIP_ENDPOINT="$(sed -n 's/^PJSIP_ENDPOINT=//p' "${CREDENTIALS_FILE}" | tail -n 1)"
     fi
 
+    log "Création du fichier de configuration ${TARGET_DIR}/.env"
     cat > "${TARGET_DIR}/.env" <<ENVEOF
 DISCORD_TOKEN=
 DISCORD_GUILD_ID=
@@ -123,26 +165,29 @@ ENVEOF
 
     chown root:"${SERVICE_USER}" "${TARGET_DIR}/.env"
     chmod 0640 "${TARGET_DIR}/.env"
+else
+    log "Configuration existante conservée : ${TARGET_DIR}/.env"
 fi
 
+log "Mise à jour du service systemd..."
 install -o root -g root -m 0644 "${SCRIPT_DIR}/discord-sip-bridge.service" /etc/systemd/system/discord-sip-bridge.service
 systemctl daemon-reload
 systemctl enable discord-sip-bridge.service
 
 if [[ "${UPDATING}" == true ]]; then
     if [[ "${WAS_RUNNING}" == true ]]; then
-        echo "Redémarrage du service discord-sip-bridge..."
+        log "Redémarrage du service discord-sip-bridge..."
         systemctl restart discord-sip-bridge
     fi
 
     echo
-    echo "Mise à jour terminée."
+    log "Mise à jour terminée."
     echo "Configuration conservée : ${TARGET_DIR}/.env"
     echo "État du service : systemctl status discord-sip-bridge --no-pager -l"
     echo "Journaux : journalctl -u discord-sip-bridge -f"
 else
     echo
-    echo "Installation terminée."
+    log "Installation terminée."
     echo "Configuration : ${TARGET_DIR}/.env"
     echo "Démarrage : systemctl start discord-sip-bridge"
     echo "Journaux : journalctl -u discord-sip-bridge -f"

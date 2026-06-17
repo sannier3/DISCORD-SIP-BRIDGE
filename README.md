@@ -47,6 +47,8 @@ Le script télécharge automatiquement les sources depuis GitHub, installe les d
 
 **La même commande sert aussi à mettre à jour** une installation existante : le code et les dépendances npm sont remplacés, le fichier `.env` est conservé, et le service est redémarré s’il tournait déjà.
 
+> Si le script semble bloqué sans message, c’est en général l’une de ces étapes lentes : paquets Debian (`man-db`), compilation npm des modules audio (2 à 5 min), ou arrêt du service en cours d’appel. La version actuelle du script affiche une ligne `[HH:MM:SS]` à chaque étape.
+
 Puis configurer le bot (première installation uniquement) :
 
 ```bash
