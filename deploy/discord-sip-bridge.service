@@ -1,0 +1,30 @@
+[Unit]
+Description=Pont Discord vers Asterisk et Yeastar
+Wants=network-online.target asterisk.service
+After=network-online.target asterisk.service
+
+[Service]
+Type=simple
+User=discord-sip
+Group=discord-sip
+WorkingDirectory=/opt/discord-sip-bridge
+EnvironmentFile=/opt/discord-sip-bridge/.env
+ExecStart=/usr/bin/node /opt/discord-sip-bridge/server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,33 @@
+{
+  "name": "discord-sip-bridge",
+  "version": "1.0.0",
+  "description": "Pont audio bidirectionnel Discord vers Asterisk et Yeastar",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sannier3/DISCORD-SIP-BRIDGE.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sannier3/DISCORD-SIP-BRIDGE/issues"
+  },
+  "homepage": "https://github.com/sannier3/DISCORD-SIP-BRIDGE#readme",
+  "author": "JBSAN3",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.18.0",
+    "discord.js": "^14.21.0",
+    "dotenv": "^16.6.1",
+    "prism-media": "^1.3.5",
+    "sodium-native": "^4.3.1",
+    "ws": "^8.18.3"
+  }
+}

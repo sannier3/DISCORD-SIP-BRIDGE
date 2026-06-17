@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Installer les dépendances système pour les modules natifs
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev libsodium-dev build-essential pkg-config
+
+      - name: Installer les dépendances npm
+        run: npm ci
+
+      - name: Vérifier la syntaxe
+        run: npm run check
