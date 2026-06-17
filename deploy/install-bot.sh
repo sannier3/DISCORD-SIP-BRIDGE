@@ -34,6 +34,25 @@ if [[ ! -f "${SOURCE_DIR}/server.js" ]]; then
     git clone --depth 1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${CLONE_DIR}"
     SOURCE_DIR="${CLONE_DIR}"
     SCRIPT_DIR="${CLONE_DIR}/deploy"
+elif [[ -d "${SOURCE_DIR}/.git" ]]; then
+    echo "Mise à jour des sources locales depuis ${REPO_URL} (branche ${REPO_BRANCH})..."
+    git -C "${SOURCE_DIR}" fetch --depth 1 origin "${REPO_BRANCH}"
+    git -C "${SOURCE_DIR}" checkout "${REPO_BRANCH}"
+    git -C "${SOURCE_DIR}" reset --hard "origin/${REPO_BRANCH}"
+fi
+
+UPDATING=false
+WAS_RUNNING=false
+if [[ -f "${TARGET_DIR}/server.js" ]]; then
+    UPDATING=true
+    echo "Mise à jour de l'installation existante dans ${TARGET_DIR}..."
+    if systemctl is-active --quiet discord-sip-bridge 2>/dev/null; then
+        WAS_RUNNING=true
+        echo "Arrêt temporaire du service discord-sip-bridge..."
+        systemctl stop discord-sip-bridge
+    fi
+else
+    echo "Nouvelle installation dans ${TARGET_DIR}..."
 fi
 
 if ! command -v node >/dev/null 2>&1 || [[ "$(node -p 'Number(process.versions.node.split(".")[0])')" -lt 22 ]]; then
@@ -110,9 +129,23 @@ install -o root -g root -m 0644 "${SCRIPT_DIR}/discord-sip-bridge.service" /etc/
 systemctl daemon-reload
 systemctl enable discord-sip-bridge.service
 
-echo
-echo "Installation terminée."
-echo "Configuration : ${TARGET_DIR}/.env"
-echo "Démarrage : systemctl start discord-sip-bridge"
-echo "Journaux : journalctl -u discord-sip-bridge -f"
-echo "Réinstallation : curl -fsSL ${RAW_INSTALL_URL} | bash"
+if [[ "${UPDATING}" == true ]]; then
+    if [[ "${WAS_RUNNING}" == true ]]; then
+        echo "Redémarrage du service discord-sip-bridge..."
+        systemctl restart discord-sip-bridge
+    fi
+
+    echo
+    echo "Mise à jour terminée."
+    echo "Configuration conservée : ${TARGET_DIR}/.env"
+    echo "État du service : systemctl status discord-sip-bridge --no-pager -l"
+    echo "Journaux : journalctl -u discord-sip-bridge -f"
+else
+    echo
+    echo "Installation terminée."
+    echo "Configuration : ${TARGET_DIR}/.env"
+    echo "Démarrage : systemctl start discord-sip-bridge"
+    echo "Journaux : journalctl -u discord-sip-bridge -f"
+fi
+
+echo "Installation ou mise à jour : curl -fsSL ${RAW_INSTALL_URL} | bash"

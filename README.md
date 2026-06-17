@@ -45,7 +45,9 @@ curl -fsSL https://raw.githubusercontent.com/sannier3/DISCORD-SIP-BRIDGE/main/de
 
 Le script télécharge automatiquement les sources depuis GitHub, installe les dépendances, déploie le bot dans `/opt/discord-sip-bridge` et active le service systemd.
 
-Puis configurer le bot :
+**La même commande sert aussi à mettre à jour** une installation existante : le code et les dépendances npm sont remplacés, le fichier `.env` est conservé, et le service est redémarré s’il tournait déjà.
+
+Puis configurer le bot (première installation uniquement) :
 
 ```bash
 sudo nano /opt/discord-sip-bridge/.env
