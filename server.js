@@ -29,6 +29,7 @@ import {
     createAudioPlayer,
     createAudioResource,
     entersState,
+    generateDependencyReport,
     joinVoiceChannel,
 } from '@discordjs/voice';
 
@@ -131,6 +132,8 @@ const config = {
     restrictCommandsToVoiceText: booleanEnvironment('RESTRICT_COMMANDS_TO_VOICE_TEXT', false),
     hideCalledNumber: booleanEnvironment('HIDE_CALLED_NUMBER', true),
     statusRefreshIntervalSeconds: integerEnvironment('STATUS_REFRESH_INTERVAL_SECONDS', 5, 1),
+    voiceConnectionTimeoutSeconds: integerEnvironment('VOICE_CONNECTION_TIMEOUT_SECONDS', 30, 10),
+    voiceDebug: booleanEnvironment('VOICE_DEBUG', false),
 };
 
 function log(level, message, context = undefined) {
@@ -764,6 +767,36 @@ class CallManager {
         this.userCallHistory.set(userId, recentCalls);
     }
 
+    async waitForVoiceConnectionReady(session) {
+        const timeoutMs = config.voiceConnectionTimeoutSeconds * 1000;
+
+        try {
+            await entersState(
+                session.voiceConnection,
+                VoiceConnectionStatus.Ready,
+                timeoutMs,
+            );
+        } catch (error) {
+            const currentStatus = session.voiceConnection?.state?.status ?? 'inconnu';
+
+            log('error', 'Connexion au salon vocal Discord impossible', {
+                sessionId: session.id,
+                guildId: session.guildId,
+                voiceChannelId: session.voiceChannelId,
+                currentStatus,
+                timeoutMs,
+                error: errorText(error),
+            });
+
+            throw new Error(
+                `Connexion au salon vocal Discord impossible après `
+                + `${config.voiceConnectionTimeoutSeconds} secondes `
+                + `(état final: ${currentStatus})`,
+                { cause: error },
+            );
+        }
+    }
+
     async startCall(interaction, rawNumber) {
         if (!interaction.inGuild() || !interaction.guild) {
             throw new Error('Cette commande doit être utilisée dans un serveur Discord.');
@@ -775,8 +808,8 @@ class CallManager {
         }
 
         const voiceChannel = member.voice.channel;
-        if (!voiceChannel || voiceChannel.type !== ChannelType.GuildVoice) {
-            throw new Error('Tu dois être présent dans un salon vocal classique avant de lancer l’appel.');
+        if (!voiceChannel?.isVoiceBased()) {
+            throw new Error('Tu dois être présent dans un salon vocal avant de lancer l’appel.');
         }
 
         if (this.sessionsByGuild.has(interaction.guildId)) {
@@ -796,6 +829,11 @@ class CallManager {
             PermissionFlagsBits.Speak,
         ]) {
             if (!voicePermissions?.has(permission)) {
+                if (voiceChannel.type === ChannelType.GuildStageVoice) {
+                    throw new Error(
+                        'Le bot n’a pas les permissions nécessaires dans ce salon Stage (Voir, Se connecter, Parler).',
+                    );
+                }
                 throw new Error('Le bot n’a pas les permissions Voir, Se connecter et Parler dans ce salon vocal.');
             }
         }
@@ -826,6 +864,7 @@ class CallManager {
             statusRefreshTimer: null,
             voiceConnection: null,
             audioPlayer: null,
+            audioSubscription: null,
             phoneToDiscordStream: null,
             phoneToDiscordTransform: null,
             discordReceiveStream: null,
@@ -835,6 +874,9 @@ class CallManager {
             mediaChannelId: `media-${sessionId}`,
             phoneChannelId: `phone-${sessionId}`,
             bridgeId: `bridge-${sessionId}`,
+            asteriskMediaCreated: false,
+            asteriskBridgeCreated: false,
+            asteriskPhoneChannelCreated: false,
             callTimeoutTimer: null,
             maxDurationTimer: null,
         };
@@ -857,6 +899,28 @@ class CallManager {
                 selfDeaf: false,
                 selfMute: false,
                 group: `sip-${interaction.guildId}`,
+                daveEncryption: true,
+                decryptionFailureTolerance: 24,
+                debug: config.voiceDebug,
+            });
+
+            session.voiceConnection.on('stateChange', (oldState, newState) => {
+                log('info', 'État vocal Discord modifié', {
+                    sessionId: session.id,
+                    guildId: session.guildId,
+                    voiceChannelId: session.voiceChannelId,
+                    previousStatus: oldState.status,
+                    newStatus: newState.status,
+                });
+            });
+
+            session.voiceConnection.on('debug', (message) => {
+                if (config.voiceDebug) {
+                    log('info', 'Diagnostic vocal Discord', {
+                        sessionId: session.id,
+                        message,
+                    });
+                }
             });
 
             session.voiceConnection.on(VoiceConnectionStatus.Disconnected, () => {
@@ -865,12 +929,18 @@ class CallManager {
             session.voiceConnection.on('error', (error) => {
                 log('error', 'Erreur de connexion vocale Discord', {
                     sessionId,
+                    currentStatus: session.voiceConnection?.state?.status ?? 'inconnu',
                     error: errorText(error),
                 });
                 void this.endCall(session, 'Erreur de connexion vocale Discord');
             });
 
-            await entersState(session.voiceConnection, VoiceConnectionStatus.Ready, 20_000);
+            await this.waitForVoiceConnectionReady(session);
+            log('info', 'Connexion vocale Discord prête', {
+                sessionId: session.id,
+                guildId: session.guildId,
+                voiceChannelId: session.voiceChannelId,
+            });
             this.configureDiscordAudio(session);
             await this.updateStatus(session, 'preparing', 'Connexion à Asterisk');
 
@@ -923,7 +993,13 @@ class CallManager {
             inputType: StreamType.Raw,
         });
         session.audioPlayer.play(resource);
-        session.voiceConnection.subscribe(session.audioPlayer);
+        const subscription = session.voiceConnection.subscribe(session.audioPlayer);
+        if (!subscription) {
+            throw new Error(
+                'Impossible d’abonner le lecteur audio à la connexion vocale Discord.',
+            );
+        }
+        session.audioSubscription = subscription;
 
         session.audioPlayer.on('error', (error) => {
             log('error', 'Erreur du lecteur audio Discord', {
@@ -1057,6 +1133,7 @@ class CallManager {
         });
 
         await session.mediaSocket.connect();
+        session.asteriskMediaCreated = true;
     }
 
     async createAsteriskCall(session) {
@@ -1068,6 +1145,7 @@ class CallManager {
                 name: `discord-${session.guildId}`,
             },
         );
+        session.asteriskBridgeCreated = true;
 
         await this.ari.request(
             'POST',
@@ -1089,6 +1167,7 @@ class CallManager {
                 },
             },
         );
+        session.asteriskPhoneChannelCreated = true;
 
         await this.ari.request(
             'POST',
@@ -1279,20 +1358,33 @@ class CallManager {
         session.discordToPhoneTransform?.destroy();
         session.phoneToDiscordTransform?.end();
         session.phoneToDiscordStream?.end();
+        session.audioSubscription?.unsubscribe();
         session.audioPlayer?.stop(true);
         session.mediaSocket?.close();
 
-        await Promise.allSettled([
-            this.ari.safeDelete(
-                `channels/${encodeURIComponent(session.phoneChannelId)}`,
-                { reason: 'normal' },
-            ),
-            this.ari.safeDelete(
-                `channels/${encodeURIComponent(session.mediaChannelId)}`,
-                { reason: 'normal' },
-            ),
-        ]);
-        await this.ari.safeDelete(`bridges/${encodeURIComponent(session.bridgeId)}`);
+        const cleanupPromises = [];
+        if (session.asteriskPhoneChannelCreated) {
+            cleanupPromises.push(
+                this.ari.safeDelete(
+                    `channels/${encodeURIComponent(session.phoneChannelId)}`,
+                    { reason: 'normal' },
+                ),
+            );
+        }
+        if (session.asteriskMediaCreated) {
+            cleanupPromises.push(
+                this.ari.safeDelete(
+                    `channels/${encodeURIComponent(session.mediaChannelId)}`,
+                    { reason: 'normal' },
+                ),
+            );
+        }
+        if (session.asteriskBridgeCreated) {
+            cleanupPromises.push(
+                this.ari.safeDelete(`bridges/${encodeURIComponent(session.bridgeId)}`),
+            );
+        }
+        await Promise.allSettled(cleanupPromises);
 
         try {
             session.voiceConnection?.destroy();
@@ -1442,8 +1534,10 @@ async function registerDiscordCommands() {
     }
 
     if (config.discordGuildId) {
-        const guild = await discordClient.guilds.fetch(config.discordGuildId);
-        await guild.commands.set(commandDefinitions);
+        await discordClient.application.commands.set(
+            commandDefinitions,
+            config.discordGuildId,
+        );
         log('info', 'Commandes Discord enregistrées dans le serveur', {
             guildId: config.discordGuildId,
         });
@@ -1634,6 +1728,8 @@ process.once('SIGTERM', () => {
 });
 
 async function main() {
+    log('info', 'Rapport des dépendances vocales Discord');
+    console.info(generateDependencyReport());
     await ariClient.start();
     await discordClient.login(config.discordToken);
 }

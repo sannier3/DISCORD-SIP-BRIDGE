@@ -133,6 +133,8 @@ Copier `.env.example` vers `.env` et renseigner les variables. Les principales :
 | `RESTRICT_COMMANDS_TO_VOICE_TEXT` | Commandes uniquement dans le chat textuel des salons vocaux |
 | `HIDE_CALLED_NUMBER` | Masque le numéro appelé dans le message d’état Discord |
 | `STATUS_REFRESH_INTERVAL_SECONDS` | Actualisation du message d’appel en cours (défaut : 5 s) |
+| `VOICE_CONNECTION_TIMEOUT_SECONDS` | Délai d’attente de la connexion vocale Discord (défaut : 30 s) |
+| `VOICE_DEBUG` | Journaux détaillés de `@discordjs/voice` (défaut : `false`) |
 | `ALLOWED_NUMBER_REGEX` | Expression régulière des numéros autorisés |
 
 Voir `.env.example` pour la liste complète.
@@ -144,6 +146,55 @@ systemctl start discord-sip-bridge
 systemctl status discord-sip-bridge --no-pager -l
 journalctl -u discord-sip-bridge -f
 ```
+
+## Mise à jour des dépendances vocales
+
+Après une mise à jour du code ou des dépendances Discord :
+
+```bash
+cd /opt/discord-sip-bridge
+rm -rf node_modules package-lock.json
+npm install
+npm run check
+npm run voice-report
+sudo systemctl restart discord-sip-bridge
+sudo journalctl -u discord-sip-bridge -f
+```
+
+### Journaux attendus au démarrage
+
+```text
+Rapport des dépendances vocales Discord
+WebSocket ARI connecté
+Bot Discord connecté
+Commandes Discord enregistrées dans le serveur
+```
+
+### Journaux attendus lors de `/appeler`
+
+```text
+État vocal Discord modifié ... newStatus: signalling
+État vocal Discord modifié ... newStatus: connecting
+État vocal Discord modifié ... newStatus: ready
+Connexion vocale Discord prête
+Appel lancé
+```
+
+Pour diagnostiquer un problème de connexion vocale, activez temporairement :
+
+```dotenv
+VOICE_DEBUG=true
+VOICE_CONNECTION_TIMEOUT_SECONDS=30
+```
+
+Puis redémarrez le service. Remettez `VOICE_DEBUG=false` une fois le problème résolu.
+
+## Dépannage vocal Discord
+
+- **État bloqué sur `signalling`** : vérifier que le bot reçoit bien les événements `VOICE_STATE_UPDATE` et `VOICE_SERVER_UPDATE` (intents `Guilds` et `GuildVoiceStates`).
+- **État bloqué sur `connecting`** : vérifier la sortie UDP du serveur vers les serveurs vocaux Discord (pare-feu, NAT, Proxmox).
+- **État `ready` mais aucun canal Asterisk** : vérifier les appels ARI exécutés après cette étape dans les journaux.
+- **Appel Asterisk lancé sans audio** : diagnostiquer séparément le RTP Yeastar et le WebSocket média Asterisk.
 
 ## Structure du dépôt
 
