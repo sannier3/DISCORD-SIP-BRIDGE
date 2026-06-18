@@ -55,9 +55,7 @@ Le script télécharge automatiquement les sources depuis GitHub, installe les d
 
 > Si le script semble bloqué sans message, c’est en général l’une de ces étapes lentes : paquets Debian (`man-db`), compilation npm des modules audio (2 à 5 min), ou arrêt du service en cours d’appel. La version actuelle du script affiche une ligne `[HH:MM:SS]` à chaque étape.
 
-> Le tiret `-` qui tourne seul est le spinner npm (pas un blocage). Le script utilise `--no-progress` et affiche les logs en mode `--verbose`.
-
-Si `npm` tente de joindre un registre interne (`EHOSTUNREACH`), vérifiez qu’aucun fichier `~/.npmrc` ni variable `npm_config_*` ne redirige vers un registre privé.
+> Le tiret `-` qui tourne seul est le spinner npm (pas un blocage). Utilisez `--verbose` pour plus de détails.
 
 Puis configurer le bot (première installation uniquement) :
 

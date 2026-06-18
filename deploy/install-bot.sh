@@ -58,72 +58,6 @@ log() {
     echo "[$(date +%H:%M:%S)] $*"
 }
 
-run_npm() {
-    local empty_npmrc status
-    empty_npmrc="$(mktemp)"
-
-    # Ignore toute config npm globale (registre interne, cache, etc.)
-    unset npm_config_registry npm_config_userconfig npm_config_globalconfig npm_config_cache npm_config_progress
-    unset NPM_CONFIG_REGISTRY NPM_CONFIG_USERCONFIG NPM_CONFIG_GLOBALCONFIG NPM_CONFIG_CACHE || true
-    export CI=true
-
-    npm --userconfig="${empty_npmrc}" --globalconfig="${empty_npmrc}" "$@"
-    status=$?
-    rm -f "${empty_npmrc}"
-    return "${status}"
-}
-
-install_npm_dependencies() {
-    log "Test de connectivité vers registry.npmjs.org..."
-    if ! curl -fsS --max-time 20 -o /dev/null "https://registry.npmjs.org/"; then
-        log "ERREUR : registry.npmjs.org inaccessible depuis ce serveur."
-        exit 1
-    fi
-
-    log "npm $(npm -v), node $(node -v)"
-    log "Nettoyage de node_modules..."
-    rm -rf "${TARGET_DIR}/node_modules"
-    rm -f "${TARGET_DIR}/.npmrc"
-
-    log "Installation des dépendances npm (loglevel=${NPM_LOGLEVEL}, 2 à 10 minutes)..."
-    if [[ "${VERBOSE}" == true ]]; then
-        log "Mode verbeux : chaque ligne npm est affichée, signalement toutes les 30 s."
-    fi
-
-    local npm_args=(
-        ci --omit=dev
-        --registry=https://registry.npmjs.org/
-        --foreground-scripts
-        --no-progress
-        --loglevel="${NPM_LOGLEVEL}"
-        --fetch-timeout=120000
-        --fetch-retries=5
-    )
-
-    if [[ "${VERBOSE}" == true ]]; then
-        (
-            while true; do
-                sleep 30
-                log "npm toujours en cours..."
-            done
-        ) &
-        local heartbeat_pid=$!
-        set +e
-        run_npm "${npm_args[@]}" 2>&1 | while IFS= read -r line; do
-            printf '[npm] %s\n' "${line}"
-        done
-        local npm_status=${PIPESTATUS[0]}
-        set -e
-        kill "${heartbeat_pid}" 2>/dev/null || true
-        wait "${heartbeat_pid}" 2>/dev/null || true
-        if [[ "${npm_status}" -ne 0 ]]; then
-            exit "${npm_status}"
-        fi
-    else
-        run_npm "${npm_args[@]}"
-    fi
-}
-
 apt_install() {
     if command -v debconf-set-selections >/dev/null 2>&1; then
         echo 'man-db man-db/auto-update boolean false' | debconf-set-selections
@@ -201,9 +135,12 @@ install -o root -g "${SERVICE_USER}" -m 0640 "${SOURCE_DIR}/package.json" "${TAR
 install -o root -g "${SERVICE_USER}" -m 0640 "${SOURCE_DIR}/package-lock.json" "${TARGET_DIR}/package-lock.json"
 
 cd "${TARGET_DIR}"
-install_npm_dependencies
+log "npm $(npm -v), node $(node -v)"
+rm -rf "${TARGET_DIR}/node_modules"
+log "Installation des dépendances npm (2 à 10 minutes)..."
+npm ci --omit=dev --no-progress --foreground-scripts --loglevel="${NPM_LOGLEVEL}"
 log "Vérification du code..."
-run_npm run check --registry=https://registry.npmjs.org/
+npm run check
 
 log "Application des permissions..."
 chown -R root:"${SERVICE_USER}" "${TARGET_DIR}"
