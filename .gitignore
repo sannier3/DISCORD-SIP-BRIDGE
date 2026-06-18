@@ -34,9 +34,6 @@ build/
 *.zip
 *.tar.gz
 
-# npm (généré par le script d'installation sur le serveur)
-.npmrc
-
 # Couverture et cache de tests
 coverage/
 .nyc_output/
