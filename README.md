@@ -98,7 +98,7 @@ Pour limiter les commandes au salon textuel des salons vocaux :
 RESTRICT_COMMANDS_TO_VOICE_TEXT=true
 ```
 
-Cette option masque également les commandes dans l’interface Discord des autres salons (nécessite `DISCORD_GUILD_ID`).
+Cette option impose le salon textuel d’un salon vocal **à l’exécution** (le bot refuse la commande ailleurs). Pour masquer les commandes dans l’interface Discord, configurez les salons dans **Paramètres du serveur → Intégrations → votre bot** (Discord exige une autorisation OAuth pour le faire par code).
 
 ### Développement local
 

@@ -10,12 +10,12 @@ import WebSocket from 'ws';
 import prism from 'prism-media';
 import {
     ActionRowBuilder,
-    ApplicationCommandPermissionType,
     ButtonBuilder,
     ButtonStyle,
     ChannelType,
     Client,
     EmbedBuilder,
+    Events,
     GatewayIntentBits,
     PermissionFlagsBits,
     SlashCommandBuilder,
@@ -1436,60 +1436,24 @@ const ariClient = new AriClient({
 });
 const callManager = new CallManager(discordClient, ariClient);
 
-async function syncVoiceChannelCommandPermissions(guild) {
-    if (!config.restrictCommandsToVoiceText) {
-        return;
-    }
-
-    await guild.channels.fetch();
-    const voiceChannels = [...guild.channels.cache.values()]
-        .filter((channel) => channel.isVoiceBased());
-
-    if (voiceChannels.length === 0) {
-        log('warn', 'Aucun salon vocal trouvé pour restreindre les commandes', {
-            guildId: guild.id,
-        });
-        return;
-    }
-
-    const commands = await guild.commands.fetch();
-    const permissions = voiceChannels.map((channel) => ({
-        id: channel.id,
-        type: ApplicationCommandPermissionType.Channel,
-        permission: true,
-    }));
-
-    for (const command of commands.values()) {
-        await guild.commands.permissions.set({
-            command: command.id,
-            permissions,
-        });
-    }
-
-    log('info', 'Commandes restreintes aux salons textuels des salons vocaux', {
-        guildId: guild.id,
-        voiceChannels: voiceChannels.length,
-        commands: commands.size,
-    });
-}
-
 async function registerDiscordCommands() {
     if (!config.registerCommands) {
         return;
     }
 
-    if (config.restrictCommandsToVoiceText && !config.discordGuildId) {
-        log('warn', 'RESTRICT_COMMANDS_TO_VOICE_TEXT nécessite DISCORD_GUILD_ID pour masquer les commandes dans l’interface Discord');
-    }
-
     if (config.discordGuildId) {
         const guild = await discordClient.guilds.fetch(config.discordGuildId);
         await guild.commands.set(commandDefinitions);
-        await syncVoiceChannelCommandPermissions(guild);
         log('info', 'Commandes Discord enregistrées dans le serveur', {
             guildId: config.discordGuildId,
         });
+        if (config.restrictCommandsToVoiceText) {
+            log('info', 'RESTRICT_COMMANDS_TO_VOICE_TEXT actif : contrôle à l’exécution uniquement. Pour masquer les commandes dans l’interface Discord, configurez les salons dans Paramètres du serveur → Intégrations → le bot.');
+        }
     } else {
+        if (config.restrictCommandsToVoiceText) {
+            log('warn', 'RESTRICT_COMMANDS_TO_VOICE_TEXT nécessite DISCORD_GUILD_ID pour un contrôle fiable par serveur.');
+        }
         await discordClient.application.commands.set(commandDefinitions);
         log('info', 'Commandes Discord globales enregistrées');
     }
@@ -1604,7 +1568,7 @@ async function handleButton(interaction) {
     }
 }
 
-discordClient.once('ready', async () => {
+discordClient.once(Events.ClientReady, async () => {
     log('info', 'Bot Discord connecté', {
         user: discordClient.user.tag,
         guilds: discordClient.guilds.cache.size,
@@ -1629,42 +1593,6 @@ discordClient.on('interactionCreate', (interaction) => {
 
 discordClient.on('voiceStateUpdate', (oldState, newState) => {
     void callManager.handleVoiceStateUpdate(oldState, newState);
-});
-
-discordClient.on('channelCreate', (channel) => {
-    if (
-        !config.restrictCommandsToVoiceText
-        || !config.discordGuildId
-        || channel.guild?.id !== config.discordGuildId
-        || !channel.isVoiceBased?.()
-    ) {
-        return;
-    }
-
-    void syncVoiceChannelCommandPermissions(channel.guild).catch((error) => {
-        log('warn', 'Mise à jour des permissions de commandes impossible', {
-            guildId: channel.guild.id,
-            error: errorText(error),
-        });
-    });
-});
-
-discordClient.on('channelDelete', (channel) => {
-    if (
-        !config.restrictCommandsToVoiceText
-        || !config.discordGuildId
-        || channel.guild?.id !== config.discordGuildId
-        || !channel.isVoiceBased?.()
-    ) {
-        return;
-    }
-
-    void syncVoiceChannelCommandPermissions(channel.guild).catch((error) => {
-        log('warn', 'Mise à jour des permissions de commandes impossible', {
-            guildId: channel.guild.id,
-            error: errorText(error),
-        });
-    });
 });
 
 discordClient.on('error', (error) => {
