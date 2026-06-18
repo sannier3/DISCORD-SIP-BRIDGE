@@ -43,6 +43,12 @@ Dépôt : [github.com/sannier3/DISCORD-SIP-BRIDGE](https://github.com/sannier3/D
 curl -fsSL https://raw.githubusercontent.com/sannier3/DISCORD-SIP-BRIDGE/main/deploy/install-bot.sh | sudo bash
 ```
 
+Mode verbeux (affiche la compilation npm en direct) :
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sannier3/DISCORD-SIP-BRIDGE/main/deploy/install-bot.sh | sudo bash -s -- --verbose
+```
+
 Le script télécharge automatiquement les sources depuis GitHub, installe les dépendances, déploie le bot dans `/opt/discord-sip-bridge` et active le service systemd.
 
 **La même commande sert aussi à mettre à jour** une installation existante : le code et les dépendances npm sont remplacés, le fichier `.env` est conservé, et le service est redémarré s’il tournait déjà.

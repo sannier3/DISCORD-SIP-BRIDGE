@@ -5,6 +5,25 @@ REPO_URL="https://github.com/sannier3/DISCORD-SIP-BRIDGE.git"
 REPO_BRANCH="main"
 RAW_INSTALL_URL="https://raw.githubusercontent.com/sannier3/DISCORD-SIP-BRIDGE/main/deploy/install-bot.sh"
 
+NPM_LOGLEVEL="info"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -v|--verbose)
+            NPM_LOGLEVEL="verbose"
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 [-v|--verbose]"
+            echo "  -v, --verbose   Affiche la sortie détaillée de npm (compilation incluse)"
+            exit 0
+            ;;
+        *)
+            echo "Option inconnue : $1 (essayez --help)" >&2
+            exit 1
+            ;;
+    esac
+done
+
 if [[ ${EUID} -ne 0 ]]; then
     echo "Ce script doit être exécuté en root." >&2
     exit 1
@@ -116,8 +135,8 @@ install -o root -g "${SERVICE_USER}" -m 0640 "${SOURCE_DIR}/package-lock.json" "
 cd "${TARGET_DIR}"
 rm -f "${TARGET_DIR}/.npmrc"
 
-log "Installation des dépendances npm (compilation audio, 2 à 5 minutes)..."
-npm ci --omit=dev --loglevel=warn --registry=https://registry.npmjs.org/
+log "Installation des dépendances npm (compilation audio, 2 à 5 minutes, loglevel=${NPM_LOGLEVEL})..."
+npm ci --omit=dev --loglevel="${NPM_LOGLEVEL}" --foreground-scripts --registry=https://registry.npmjs.org/
 log "Vérification du code..."
 npm run check
 
@@ -203,3 +222,4 @@ else
 fi
 
 echo "Installation ou mise à jour : curl -fsSL ${RAW_INSTALL_URL} | bash"
+echo "Mode verbeux : curl -fsSL ${RAW_INSTALL_URL} | bash -s -- --verbose"
