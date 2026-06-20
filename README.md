@@ -132,12 +132,48 @@ Copier `.env.example` vers `.env` et renseigner les variables. Les principales :
 | `AUTHORIZED_ROLE_IDS` | Rôles autorisés (si restriction activée) |
 | `RESTRICT_COMMANDS_TO_VOICE_TEXT` | Commandes uniquement dans le chat textuel des salons vocaux |
 | `HIDE_CALLED_NUMBER` | Masque le numéro appelé dans le message d’état Discord |
+| `CALLED_NUMBER_PATTERN` | Modèles Yeastar autorisés, séparés par des virgules (`X`, `Z`, `.`) |
+| `CALLED_NUMBER_MASK_START` | Chiffres masqués au début sur Discord |
+| `CALLED_NUMBER_MASK_END` | Chiffres masqués à la fin sur Discord |
+| `OUTBOUND_DIAL_RULES` | Préfixe Yeastar caché : `pattern:prefix`, séparés par des virgules (ordre important) |
 | `STATUS_REFRESH_INTERVAL_SECONDS` | Actualisation du message d’appel en cours (défaut : 5 s) |
 | `VOICE_CONNECTION_TIMEOUT_SECONDS` | Délai d’attente de la connexion vocale Discord (défaut : 30 s) |
 | `VOICE_DEBUG` | Journaux détaillés de `@discordjs/voice` (défaut : `false`) |
-| `ALLOWED_NUMBER_REGEX` | Expression régulière des numéros autorisés |
 
 Voir `.env.example` pour la liste complète.
+
+### Masquage des numéros et préfixe Yeastar
+
+Syntaxe du modèle Yeastar (`CALLED_NUMBER_PATTERN`) :
+
+| Symbole | Signification |
+| --- | --- |
+| `X` | Chiffre 0 à 9 |
+| `Z` | Chiffre 1 à 9 |
+| `.` | Zéro ou plusieurs chiffres |
+| `0`–`9` | Chiffre fixe |
+
+Exemple pour les numéros français :
+
+```dotenv
+CALLED_NUMBER_PATTERN=0ZXXXXXXXX,09XXXXXXXX
+HIDE_CALLED_NUMBER=true
+CALLED_NUMBER_MASK_START=3
+CALLED_NUMBER_MASK_END=3
+```
+
+`0768573209` s’affiche sur Discord comme `•••8573•••`.
+
+Préfixe de sortie Yeastar (ajouté avant numérotation, jamais affiché sur Discord). Les règles sont évaluées **dans l’ordre** : placez les modèles spécifiques avant les règles générales (`0X.`, `X.`, etc.) :
+
+```dotenv
+OUTBOUND_DIAL_RULES=0ZXXXXXXXX:8,09XXXXXXXX:9,0X.:7,X.:0
+```
+
+- `0768573209` → composé `80768573209` (règle `0ZXXXXXXXX`)
+- `0912345678` → composé `90912345678` (règle `09XXXXXXXX`)
+- autre numéro commençant par `0` → préfixe `7` via `0X.`
+- tout autre numéro autorisé → préfixe `0` via `X.`
 
 ## Démarrage
 
