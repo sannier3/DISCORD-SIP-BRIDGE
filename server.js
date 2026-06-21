@@ -207,6 +207,7 @@ const config = {
     statusRefreshIntervalSeconds: integerEnvironment('STATUS_REFRESH_INTERVAL_SECONDS', 5, 1),
     voiceConnectionTimeoutSeconds: integerEnvironment('VOICE_CONNECTION_TIMEOUT_SECONDS', 30, 10),
     voiceDebug: booleanEnvironment('VOICE_DEBUG', false),
+    audioDebug: booleanEnvironment('AUDIO_DEBUG', false),
 };
 
 function log(level, message, context = undefined) {
@@ -606,6 +607,8 @@ class AsteriskMediaSocket extends EventEmitter {
         this.canSend = true;
         this.started = false;
         this.closedByApplication = false;
+        this.bytesReceived = 0;
+        this.bytesSent = 0;
     }
 
     async connect() {
@@ -651,6 +654,7 @@ class AsteriskMediaSocket extends EventEmitter {
 
         this.socket.on('message', (data, isBinary) => {
             if (isBinary) {
+                this.bytesReceived += data.length;
                 this.emit('audio', Buffer.from(data));
                 return;
             }
@@ -724,6 +728,7 @@ class AsteriskMediaSocket extends EventEmitter {
         while (this.pending.length >= this.frameSize) {
             const frame = this.pending.subarray(0, this.frameSize);
             this.socket.send(frame, { binary: true });
+            this.bytesSent += frame.length;
             this.pending = Buffer.from(this.pending.subarray(this.frameSize));
         }
 
@@ -975,6 +980,8 @@ class CallManager {
             asteriskPhoneChannelCreated: false,
             callTimeoutTimer: null,
             maxDurationTimer: null,
+            discordPcmBytes: 0,
+            audioDiagTimer: null,
         };
 
         this.sessionsByGuild.set(session.guildId, session);
@@ -1053,6 +1060,8 @@ class CallManager {
                 }
             }, (config.callTimeoutSeconds + 5) * 1000);
 
+            this.startAudioDiagnostics(session);
+
             await this.updateStatus(session, 'dialing', 'Numérotation en cours');
             if (session.dialNumber !== session.number) {
                 log('info', 'Préfixe de sortie Yeastar appliqué', {
@@ -1076,6 +1085,50 @@ class CallManager {
             });
             await this.endCall(session, `Échec du lancement: ${errorText(error)}`);
             throw error;
+        }
+    }
+
+    startAudioDiagnostics(session) {
+        if (!config.audioDebug || session.audioDiagTimer) {
+            return;
+        }
+
+        let previousPhoneToDiscord = 0;
+        let previousDiscordToPhone = 0;
+        let previousDiscordPcm = 0;
+
+        session.audioDiagTimer = setInterval(() => {
+            if (session.ending) {
+                return;
+            }
+
+            const phoneToDiscord = session.mediaSocket?.bytesReceived ?? 0;
+            const discordToPhone = session.mediaSocket?.bytesSent ?? 0;
+            const discordPcm = session.discordPcmBytes;
+
+            log('info', 'Diagnostic audio', {
+                sessionId: session.id,
+                state: session.state,
+                muted: session.muted,
+                // Téléphone -> Discord : octets reçus du WebSocket média Asterisk
+                phoneToDiscordTotal: phoneToDiscord,
+                phoneToDiscordDelta: phoneToDiscord - previousPhoneToDiscord,
+                // Discord -> téléphone : PCM décodé depuis Discord, puis octets poussés vers Asterisk
+                discordPcmDelta: discordPcm - previousDiscordPcm,
+                discordToPhoneTotal: discordToPhone,
+                discordToPhoneDelta: discordToPhone - previousDiscordToPhone,
+            });
+
+            previousPhoneToDiscord = phoneToDiscord;
+            previousDiscordToPhone = discordToPhone;
+            previousDiscordPcm = discordPcm;
+        }, 2000);
+    }
+
+    stopAudioDiagnostics(session) {
+        if (session.audioDiagTimer) {
+            clearInterval(session.audioDiagTimer);
+            session.audioDiagTimer = null;
         }
     }
 
@@ -1141,6 +1194,7 @@ class CallManager {
             .pipe(session.discordToPhoneTransform);
 
         session.discordToPhoneTransform.on('data', (pcm) => {
+            session.discordPcmBytes += pcm.length;
             if (!session.ending && !session.muted) {
                 session.mediaSocket?.sendPcm(pcm);
             }
@@ -1244,7 +1298,7 @@ class CallManager {
             'POST',
             `bridges/${encodeURIComponent(session.bridgeId)}`,
             {
-                type: 'mixing,proxy_media',
+                type: 'mixing',
                 name: `discord-${session.guildId}`,
             },
         );
@@ -1448,6 +1502,7 @@ class CallManager {
         session.ending = true;
         session.endedAt = Date.now();
         this.stopStatusRefresh(session);
+        this.stopAudioDiagnostics(session);
 
         if (session.callTimeoutTimer) {
             clearTimeout(session.callTimeoutTimer);
