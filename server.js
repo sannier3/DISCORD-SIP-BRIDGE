@@ -1244,7 +1244,7 @@ class CallManager {
             'POST',
             `bridges/${encodeURIComponent(session.bridgeId)}`,
             {
-                type: 'mixing,proxy_media',
+                type: 'mixing',
                 name: `discord-${session.guildId}`,
             },
         );
