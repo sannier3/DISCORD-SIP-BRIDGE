@@ -107,6 +107,78 @@ function booleanEnvironment(name, defaultValue) {
     return ['1', 'true', 'yes', 'oui', 'on'].includes(raw);
 }
 
+function yeastarPatternToRegExp(pattern) {
+    let source = '^';
+
+    for (const character of pattern) {
+        if (character === 'X') {
+            source += '[0-9]';
+        } else if (character === 'Z') {
+            source += '[1-9]';
+        } else if (character === '.') {
+            source += '[0-9]*';
+        } else if (/[0-9]/u.test(character)) {
+            source += character;
+        } else {
+            throw new Error(
+                `Modèle Yeastar invalide « ${pattern} » : caractères autorisés 0-9, X, Z et .`,
+            );
+        }
+    }
+
+    source += '$';
+    return new RegExp(source, 'u');
+}
+
+function parseCommaSeparatedEntries(raw) {
+    if (!raw?.trim()) {
+        return [];
+    }
+
+    return raw.split(',').map((entry) => entry.trim()).filter(Boolean);
+}
+
+function parseCalledNumberPatterns(raw) {
+    const patterns = parseCommaSeparatedEntries(raw || '0ZXXXXXXXX');
+    if (patterns.length === 0) {
+        throw new Error('CALLED_NUMBER_PATTERN doit contenir au moins un modèle.');
+    }
+
+    return patterns.map((pattern) => ({
+        pattern,
+        regex: yeastarPatternToRegExp(pattern),
+    }));
+}
+
+function parseOutboundDialRules(raw) {
+    if (!raw?.trim()) {
+        return [];
+    }
+
+    return parseCommaSeparatedEntries(raw).flatMap((entry, index) => {
+        const separator = entry.indexOf(':');
+        if (separator <= 0) {
+            throw new Error(
+                `OUTBOUND_DIAL_RULES entrée ${index + 1} invalide : attendu pattern:prefix`,
+            );
+        }
+
+        const pattern = entry.slice(0, separator).trim();
+        const prefix = entry.slice(separator + 1).trim();
+        if (!pattern || !prefix) {
+            throw new Error(
+                `OUTBOUND_DIAL_RULES entrée ${index + 1} invalide : pattern et prefix obligatoires`,
+            );
+        }
+
+        return [{
+            pattern,
+            prefix,
+            regex: yeastarPatternToRegExp(pattern),
+        }];
+    });
+}
+
 const config = {
     discordToken: requiredEnvironment('DISCORD_TOKEN'),
     discordGuildId: process.env.DISCORD_GUILD_ID?.trim() || null,
@@ -119,10 +191,7 @@ const config = {
     callerIdNumber: process.env.CALLER_ID_NUMBER?.trim() || '1000',
     allowedUserIds: csvEnvironment('AUTHORIZED_USER_IDS'),
     allowedRoleIds: csvEnvironment('AUTHORIZED_ROLE_IDS'),
-    allowedNumberRegex: new RegExp(
-        process.env.ALLOWED_NUMBER_REGEX?.trim() || '^(?:0[1-7]|09)[0-9]{8}$',
-        'u',
-    ),
+    calledNumberPatterns: parseCalledNumberPatterns(process.env.CALLED_NUMBER_PATTERN),
     callTimeoutSeconds: integerEnvironment('CALL_TIMEOUT_SECONDS', 60, 5),
     maxCallDurationSeconds: integerEnvironment('MAX_CALL_DURATION_SECONDS', 3600, 30),
     maxConcurrentCalls: integerEnvironment('MAX_CONCURRENT_CALLS', 1, 1),
@@ -131,6 +200,10 @@ const config = {
     restrictCommandsToAuthorizedOnly: booleanEnvironment('RESTRICT_COMMANDS_TO_AUTHORIZED_ONLY', false),
     restrictCommandsToVoiceText: booleanEnvironment('RESTRICT_COMMANDS_TO_VOICE_TEXT', false),
     hideCalledNumber: booleanEnvironment('HIDE_CALLED_NUMBER', true),
+    calledNumberMaskStart: integerEnvironment('CALLED_NUMBER_MASK_START', 3, 0),
+    calledNumberMaskEnd: integerEnvironment('CALLED_NUMBER_MASK_END', 3, 0),
+    calledNumberMaskChar: process.env.CALLED_NUMBER_MASK_CHAR?.trim() || '•',
+    outboundDialRules: parseOutboundDialRules(process.env.OUTBOUND_DIAL_RULES),
     statusRefreshIntervalSeconds: integerEnvironment('STATUS_REFRESH_INTERVAL_SECONDS', 5, 1),
     voiceConnectionTimeoutSeconds: integerEnvironment('VOICE_CONNECTION_TIMEOUT_SECONDS', 30, 10),
     voiceDebug: booleanEnvironment('VOICE_DEBUG', false),
@@ -145,6 +218,37 @@ function sleep(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function formatPhoneNumberForDisplay(number) {
+    if (!config.hideCalledNumber) {
+        return number;
+    }
+
+    const maskStart = Math.min(config.calledNumberMaskStart, number.length);
+    const maskEnd = Math.min(config.calledNumberMaskEnd, number.length - maskStart);
+    const visibleLength = number.length - maskStart - maskEnd;
+
+    if (visibleLength <= 0) {
+        return config.calledNumberMaskChar.repeat(number.length);
+    }
+
+    const visiblePart = number.slice(maskStart, maskStart + visibleLength);
+    return `${config.calledNumberMaskChar.repeat(maskStart)}${visiblePart}${config.calledNumberMaskChar.repeat(maskEnd)}`;
+}
+
+function isAllowedCalledNumber(number) {
+    return config.calledNumberPatterns.some(({ regex }) => regex.test(number));
+}
+
+function resolveDialNumber(number) {
+    for (const rule of config.outboundDialRules) {
+        if (rule.regex.test(number)) {
+            return `${rule.prefix}${number}`;
+        }
+    }
+
+    return number;
+}
+
 function normalizePhoneNumber(input) {
     let number = input.trim().replace(/[\s().-]/gu, '');
 
@@ -154,24 +258,14 @@ function normalizePhoneNumber(input) {
         number = `0${number.slice(4)}`;
     }
 
-    if (!config.allowedNumberRegex.test(number)) {
+    if (!isAllowedCalledNumber(number)) {
+        const patterns = config.calledNumberPatterns.map(({ pattern }) => pattern).join(', ');
         throw new Error(
-            `Numéro refusé par ALLOWED_NUMBER_REGEX (${config.allowedNumberRegex.source}).`,
+            `Numéro refusé : aucun modèle CALLED_NUMBER_PATTERN ne correspond (${patterns}).`,
         );
     }
 
     return number;
-}
-
-function maskPhoneNumber(number) {
-    if (number.length <= 6) {
-        return number;
-    }
-    return `${number.slice(0, 4)}${'•'.repeat(number.length - 7)}${number.slice(-3)}`;
-}
-
-function displayPhoneNumber(number) {
-    return config.hideCalledNumber ? maskPhoneNumber(number) : number;
 }
 
 function isVoiceChannelTextChat(channel) {
@@ -839,6 +933,7 @@ class CallManager {
         }
 
         const number = normalizePhoneNumber(rawNumber);
+        const dialNumber = resolveDialNumber(number);
         this.checkAndRecordRateLimit(member.id);
         await this.ari.waitUntilConnected();
 
@@ -852,7 +947,8 @@ class CallManager {
             voiceChannelId: voiceChannel.id,
             voiceChannel,
             number,
-            maskedNumber: maskPhoneNumber(number),
+            dialNumber,
+            maskedNumber: formatPhoneNumberForDisplay(number),
             state: 'preparing',
             startedAt: Date.now(),
             answeredAt: null,
@@ -958,6 +1054,13 @@ class CallManager {
             }, (config.callTimeoutSeconds + 5) * 1000);
 
             await this.updateStatus(session, 'dialing', 'Numérotation en cours');
+            if (session.dialNumber !== session.number) {
+                log('info', 'Préfixe de sortie Yeastar appliqué', {
+                    sessionId,
+                    prefix: session.dialNumber.slice(0, session.dialNumber.length - session.number.length),
+                    number: session.maskedNumber,
+                });
+            }
             log('info', 'Appel lancé', {
                 sessionId,
                 guildId: session.guildId,
@@ -1151,7 +1254,7 @@ class CallManager {
             'POST',
             'channels/create',
             {
-                endpoint: `PJSIP/${session.number}@${config.pjsipEndpoint}`,
+                endpoint: `PJSIP/${session.dialNumber}@${config.pjsipEndpoint}`,
                 app: config.ariApplication,
                 appArgs: `phone,${session.id}`,
                 channelId: session.phoneChannelId,
@@ -1425,7 +1528,7 @@ class CallManager {
             .setTitle('Passerelle téléphonique Discord')
             .addFields(
                 { name: 'État', value: labels[session.state] ?? session.state, inline: true },
-                { name: 'Numéro', value: displayPhoneNumber(session.number), inline: true },
+                { name: 'Numéro', value: session.maskedNumber, inline: true },
                 { name: 'Durée', value: duration, inline: true },
                 { name: 'Initiateur', value: `<@${session.initiatorId}>`, inline: true },
                 { name: 'Salon vocal', value: `<#${session.voiceChannelId}>`, inline: true },
