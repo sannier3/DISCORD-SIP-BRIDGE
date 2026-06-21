@@ -208,6 +208,7 @@ const config = {
     voiceConnectionTimeoutSeconds: integerEnvironment('VOICE_CONNECTION_TIMEOUT_SECONDS', 30, 10),
     voiceDebug: booleanEnvironment('VOICE_DEBUG', false),
     audioDebug: booleanEnvironment('AUDIO_DEBUG', false),
+    voiceDaveEncryption: booleanEnvironment('VOICE_DAVE_ENCRYPTION', false),
 };
 
 function log(level, message, context = undefined) {
@@ -1002,7 +1003,7 @@ class CallManager {
                 selfDeaf: false,
                 selfMute: false,
                 group: `sip-${interaction.guildId}`,
-                daveEncryption: true,
+                daveEncryption: config.voiceDaveEncryption,
                 decryptionFailureTolerance: 24,
                 debug: config.voiceDebug,
             });
