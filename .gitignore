@@ -38,3 +38,6 @@ build/
 coverage/
 .nyc_output/
 .cache/
+
+.env
+asterisk/
