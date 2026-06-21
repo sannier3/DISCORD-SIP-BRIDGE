@@ -208,7 +208,7 @@ const config = {
     voiceConnectionTimeoutSeconds: integerEnvironment('VOICE_CONNECTION_TIMEOUT_SECONDS', 30, 10),
     voiceDebug: booleanEnvironment('VOICE_DEBUG', false),
     audioDebug: booleanEnvironment('AUDIO_DEBUG', false),
-    voiceDaveEncryption: booleanEnvironment('VOICE_DAVE_ENCRYPTION', false),
+    voiceDaveEncryption: booleanEnvironment('VOICE_DAVE_ENCRYPTION', true),
 };
 
 function log(level, message, context = undefined) {
