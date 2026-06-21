@@ -981,6 +981,7 @@ class CallManager {
             asteriskPhoneChannelCreated: false,
             callTimeoutTimer: null,
             maxDurationTimer: null,
+            discordRawBytes: 0,
             discordPcmBytes: 0,
             audioDiagTimer: null,
         };
@@ -1097,6 +1098,7 @@ class CallManager {
         let previousPhoneToDiscord = 0;
         let previousDiscordToPhone = 0;
         let previousDiscordPcm = 0;
+        let previousDiscordRaw = 0;
 
         session.audioDiagTimer = setInterval(() => {
             if (session.ending) {
@@ -1106,6 +1108,7 @@ class CallManager {
             const phoneToDiscord = session.mediaSocket?.bytesReceived ?? 0;
             const discordToPhone = session.mediaSocket?.bytesSent ?? 0;
             const discordPcm = session.discordPcmBytes;
+            const discordRaw = session.discordRawBytes;
 
             log('info', 'Diagnostic audio', {
                 sessionId: session.id,
@@ -1114,7 +1117,8 @@ class CallManager {
                 // Téléphone -> Discord : octets reçus du WebSocket média Asterisk
                 phoneToDiscordTotal: phoneToDiscord,
                 phoneToDiscordDelta: phoneToDiscord - previousPhoneToDiscord,
-                // Discord -> téléphone : PCM décodé depuis Discord, puis octets poussés vers Asterisk
+                // Discord -> téléphone : Opus brut reçu de Discord, PCM décodé, puis octets poussés vers Asterisk
+                discordRawDelta: discordRaw - previousDiscordRaw,
                 discordPcmDelta: discordPcm - previousDiscordPcm,
                 discordToPhoneTotal: discordToPhone,
                 discordToPhoneDelta: discordToPhone - previousDiscordToPhone,
@@ -1123,6 +1127,7 @@ class CallManager {
             previousPhoneToDiscord = phoneToDiscord;
             previousDiscordToPhone = discordToPhone;
             previousDiscordPcm = discordPcm;
+            previousDiscordRaw = discordRaw;
         }, 2000);
     }
 
@@ -1193,6 +1198,10 @@ class CallManager {
         session.discordReceiveStream
             .pipe(session.opusDecoder)
             .pipe(session.discordToPhoneTransform);
+
+        session.discordReceiveStream.on('data', (chunk) => {
+            session.discordRawBytes += chunk.length;
+        });
 
         session.discordToPhoneTransform.on('data', (pcm) => {
             session.discordPcmBytes += pcm.length;
