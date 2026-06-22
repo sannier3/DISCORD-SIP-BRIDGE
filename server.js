@@ -37,6 +37,8 @@ const CREDENTIALS_FILE = process.env.ASTERISK_CREDENTIALS_FILE?.trim()
     || '/root/discord-asterisk-credentials.txt';
 const MEDIA_SUBPROTOCOL = 'media';
 const DEFAULT_MEDIA_FRAME_SIZE = 640; // slin16, 16 kHz, mono, 20 ms
+const SILENCE_KEEPALIVE_INTERVAL_MS = 20; // cadence d'envoi du silence de confort vers Asterisk
+const SILENCE_KEEPALIVE_GAP_MS = 20; // au-delà de ce délai sans audio Discord, on insère un trame de silence
 const MAX_MEDIA_WS_BUFFER = 256 * 1024;
 const MAX_DISCORD_PCM_BUFFER = 3840 * 50;
 
@@ -984,6 +986,8 @@ class CallManager {
             discordRawBytes: 0,
             discordPcmBytes: 0,
             audioDiagTimer: null,
+            lastPhoneOutboundAt: 0,
+            silenceKeepaliveTimer: null,
         };
 
         this.sessionsByGuild.set(session.guildId, session);
@@ -1206,9 +1210,12 @@ class CallManager {
         session.discordToPhoneTransform.on('data', (pcm) => {
             session.discordPcmBytes += pcm.length;
             if (!session.ending && !session.muted) {
+                session.lastPhoneOutboundAt = Date.now();
                 session.mediaSocket?.sendPcm(pcm);
             }
         });
+
+        this.startSilenceKeepalive(session);
 
         for (const stream of [
             session.discordReceiveStream,
@@ -1224,6 +1231,36 @@ class CallManager {
                     void this.endCall(session, 'Erreur du flux audio Discord');
                 }
             });
+        }
+    }
+
+    startSilenceKeepalive(session) {
+        this.stopSilenceKeepalive(session);
+
+        // Maintient un flux RTP continu vers Asterisk/Yeastar même quand Discord n'envoie
+        // pas d'audio. Sans cela, le Yeastar détecte un audio unidirectionnel et coupe son
+        // flux sortant (téléphone -> Discord) après quelques centaines de millisecondes.
+        const silenceFrame = Buffer.alloc(DEFAULT_MEDIA_FRAME_SIZE);
+
+        session.silenceKeepaliveTimer = setInterval(() => {
+            if (session.ending || !session.mediaSocket) {
+                return;
+            }
+
+            if (Date.now() - session.lastPhoneOutboundAt < SILENCE_KEEPALIVE_GAP_MS) {
+                return;
+            }
+
+            if (session.mediaSocket.sendPcm(silenceFrame)) {
+                session.lastPhoneOutboundAt = Date.now();
+            }
+        }, SILENCE_KEEPALIVE_INTERVAL_MS);
+    }
+
+    stopSilenceKeepalive(session) {
+        if (session.silenceKeepaliveTimer) {
+            clearInterval(session.silenceKeepaliveTimer);
+            session.silenceKeepaliveTimer = null;
         }
     }
 
@@ -1513,6 +1550,7 @@ class CallManager {
         session.endedAt = Date.now();
         this.stopStatusRefresh(session);
         this.stopAudioDiagnostics(session);
+        this.stopSilenceKeepalive(session);
 
         if (session.callTimeoutTimer) {
             clearTimeout(session.callTimeoutTimer);
