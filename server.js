@@ -41,6 +41,7 @@ const PHONE_OUTPUT_TICK_MS = 10; // période du drainer (plus court que 20 ms po
 const PHONE_OUTPUT_FRAME_MS = 20; // durée audio d'une trame envoyée à Asterisk
 const PHONE_OUTPUT_JITTER_BYTES = DEFAULT_MEDIA_FRAME_SIZE * 3; // ~60 ms de pré-tampon anti-gigue
 const PHONE_OUTPUT_MAX_BYTES = DEFAULT_MEDIA_FRAME_SIZE * 25; // ~500 ms : plafond anti-latence
+const EMPTY_CHANNEL_GRACE_MS = 60_000; // délai avant de raccrocher si le vocal courant reste vide
 const MAX_MEDIA_WS_BUFFER = 256 * 1024;
 const MAX_DISCORD_PCM_BUFFER = 3840 * 50;
 
@@ -973,9 +974,6 @@ class CallManager {
             audioSubscription: null,
             phoneToDiscordStream: null,
             phoneToDiscordTransform: null,
-            discordReceiveStream: null,
-            opusDecoder: null,
-            discordToPhoneTransform: null,
             mediaSocket: null,
             mediaChannelId: `media-${sessionId}`,
             phoneChannelId: `phone-${sessionId}`,
@@ -988,9 +986,12 @@ class CallManager {
             discordRawBytes: 0,
             discordPcmBytes: 0,
             audioDiagTimer: null,
-            phoneOutboundBuffer: Buffer.alloc(0),
-            phoneOutboundPlaying: false,
+            discordSources: new Map(),
+            discordSpeakingStart: null,
             phoneOutputTimer: null,
+            statusChannelId: voiceChannel.id,
+            statusInteraction: interaction,
+            emptyChannelTimer: null,
         };
 
         this.sessionsByGuild.set(session.guildId, session);
@@ -1186,78 +1187,176 @@ class CallManager {
             }
         });
 
-        session.discordReceiveStream = session.voiceConnection.receiver.subscribe(
-            session.initiatorId,
-            {
-                end: {
-                    behavior: EndBehaviorType.Manual,
-                },
-            },
-        );
+        // Discord -> téléphone : capture dynamique de tous les locuteurs non-bot présents dans
+        // le salon courant du bot, mélangés ensemble. Les abonnements sont créés à la volée à
+        // chaque prise de parole et purgés lors des départs / changements de salon.
+        const receiver = session.voiceConnection.receiver;
+        session.discordSpeakingStart = (userId) => {
+            this.addDiscordSource(session, userId);
+        };
+        receiver.speaking.on('start', session.discordSpeakingStart);
 
-        session.opusDecoder = new prism.opus.Decoder({
+        this.startPhoneOutput(session);
+    }
+
+    addDiscordSource(session, userId) {
+        if (session.ending || !session.discordSources || session.discordSources.has(userId)) {
+            return;
+        }
+
+        // N'abonner que les membres humains réellement présents dans le salon courant du bot.
+        const channel = session.guild.channels.cache.get(session.voiceChannelId);
+        const member = channel?.isVoiceBased?.() ? channel.members.get(userId) : null;
+        if (!member || member.user.bot) {
+            return;
+        }
+
+        const receiveStream = session.voiceConnection.receiver.subscribe(userId, {
+            end: { behavior: EndBehaviorType.Manual },
+        });
+        const opusDecoder = new prism.opus.Decoder({
             rate: 48_000,
             channels: 2,
             frameSize: 960,
         });
-        session.discordToPhoneTransform = new Pcm48StereoTo16Mono();
+        const transform = new Pcm48StereoTo16Mono();
+        const source = {
+            userId,
+            receiveStream,
+            opusDecoder,
+            transform,
+            pcmBuffer: Buffer.alloc(0),
+            playing: false,
+        };
 
-        session.discordReceiveStream
-            .pipe(session.opusDecoder)
-            .pipe(session.discordToPhoneTransform);
+        receiveStream.pipe(opusDecoder).pipe(transform);
 
-        session.discordReceiveStream.on('data', (chunk) => {
+        receiveStream.on('data', (chunk) => {
             session.discordRawBytes += chunk.length;
         });
 
-        session.discordToPhoneTransform.on('data', (pcm) => {
+        transform.on('data', (pcm) => {
             session.discordPcmBytes += pcm.length;
             if (session.ending || session.muted) {
                 return;
             }
 
-            session.phoneOutboundBuffer = session.phoneOutboundBuffer.length
-                ? Buffer.concat([session.phoneOutboundBuffer, pcm])
+            source.pcmBuffer = source.pcmBuffer.length
+                ? Buffer.concat([source.pcmBuffer, pcm])
                 : Buffer.from(pcm);
 
-            // Plafonne le tampon pour éviter l'accumulation de latence en cas de rafale.
-            if (session.phoneOutboundBuffer.length > PHONE_OUTPUT_MAX_BYTES) {
-                session.phoneOutboundBuffer = Buffer.from(
-                    session.phoneOutboundBuffer.subarray(
-                        session.phoneOutboundBuffer.length - PHONE_OUTPUT_MAX_BYTES,
-                    ),
+            if (source.pcmBuffer.length > PHONE_OUTPUT_MAX_BYTES) {
+                source.pcmBuffer = Buffer.from(
+                    source.pcmBuffer.subarray(source.pcmBuffer.length - PHONE_OUTPUT_MAX_BYTES),
                 );
             }
         });
 
-        this.startPhoneOutput(session);
-
-        for (const stream of [
-            session.discordReceiveStream,
-            session.opusDecoder,
-            session.discordToPhoneTransform,
-        ]) {
+        for (const stream of [receiveStream, opusDecoder, transform]) {
             stream.on('error', (error) => {
                 if (!session.ending) {
-                    log('error', 'Erreur du flux Discord vers téléphone', {
+                    log('warn', 'Erreur d’un flux Discord vers téléphone (locuteur ignoré)', {
                         sessionId: session.id,
+                        userId,
                         error: errorText(error),
                     });
-                    void this.endCall(session, 'Erreur du flux audio Discord');
                 }
+                this.removeDiscordSource(session, userId);
             });
         }
+
+        session.discordSources.set(userId, source);
+    }
+
+    removeDiscordSource(session, userId) {
+        const source = session.discordSources?.get(userId);
+        if (!source) {
+            return;
+        }
+        try {
+            source.receiveStream?.destroy();
+            source.opusDecoder?.destroy();
+            source.transform?.destroy();
+        } catch {
+            // Flux déjà détruits.
+        }
+        session.discordSources.delete(userId);
+    }
+
+    // Purge les sources dont le locuteur n'est plus dans le salon courant du bot.
+    pruneDiscordSources(session) {
+        if (!session.discordSources) {
+            return;
+        }
+        const channel = session.guild.channels.cache.get(session.voiceChannelId);
+        const present = channel?.isVoiceBased?.() ? channel.members : null;
+        for (const userId of [...session.discordSources.keys()]) {
+            const member = present?.get(userId);
+            if (!member || member.user.bot) {
+                this.removeDiscordSource(session, userId);
+            }
+        }
+    }
+
+    clearDiscordSources(session) {
+        if (!session.discordSources) {
+            return;
+        }
+        for (const userId of [...session.discordSources.keys()]) {
+            this.removeDiscordSource(session, userId);
+        }
+    }
+
+    mixPhoneFrame(session, frameSize, sampleCount, silenceFrame) {
+        if (session.muted || !session.discordSources || session.discordSources.size === 0) {
+            return silenceFrame;
+        }
+
+        const contributors = [];
+        for (const source of session.discordSources.values()) {
+            if (!source.playing && source.pcmBuffer.length >= PHONE_OUTPUT_JITTER_BYTES) {
+                source.playing = true;
+            }
+            if (!source.playing) {
+                continue;
+            }
+            if (source.pcmBuffer.length >= frameSize) {
+                contributors.push(source.pcmBuffer.subarray(0, frameSize));
+                source.pcmBuffer = Buffer.from(source.pcmBuffer.subarray(frameSize));
+            } else {
+                // Sous-alimentation : on repasse en pré-tampon pour réabsorber la gigue.
+                source.pcmBuffer = Buffer.alloc(0);
+                source.playing = false;
+            }
+        }
+
+        if (contributors.length === 0) {
+            return silenceFrame;
+        }
+        if (contributors.length === 1) {
+            return contributors[0];
+        }
+
+        const mix = Buffer.allocUnsafe(frameSize);
+        for (let i = 0; i < sampleCount; i += 1) {
+            let sum = 0;
+            for (const frame of contributors) {
+                sum += frame.readInt16LE(i * 2);
+            }
+            mix.writeInt16LE(Math.max(-32768, Math.min(32767, sum)), i * 2);
+        }
+        return mix;
     }
 
     startPhoneOutput(session) {
         this.stopPhoneOutput(session);
 
-        // Sortie unique cadencée vers Asterisk : on draine l'audio Discord depuis un tampon
-        // de gigue à un rythme temps réel (20 ms par trame) et on n'insère du silence que
-        // lors d'un vrai manque. Cela évite à la fois le hachage (silence intercalé entre les
-        // trames de parole arrivées en rafale) et la coupure du flux RTP côté Yeastar (qui
-        // détecte un audio unidirectionnel s'il ne reçoit rien en retour).
+        // Sortie unique cadencée vers Asterisk : à chaque trame de 20 ms on mélange une trame
+        // de chaque locuteur Discord actif (tampon de gigue par source) et on n'émet du silence
+        // que lors d'un vrai manque. Cela évite le hachage et maintient un flux RTP continu vers
+        // le Yeastar (qui coupe son flux s'il détecte un audio unidirectionnel).
         const frameSize = DEFAULT_MEDIA_FRAME_SIZE;
+        const sampleCount = frameSize / 2;
         const silenceFrame = Buffer.alloc(frameSize);
         let nextFrameAt = Date.now();
 
@@ -1272,32 +1371,9 @@ class CallManager {
             while (nextFrameAt <= now && guard < 6) {
                 guard += 1;
                 nextFrameAt += PHONE_OUTPUT_FRAME_MS;
-
-                let frame = silenceFrame;
-
-                if (!session.muted) {
-                    if (
-                        !session.phoneOutboundPlaying
-                        && session.phoneOutboundBuffer.length >= PHONE_OUTPUT_JITTER_BYTES
-                    ) {
-                        session.phoneOutboundPlaying = true;
-                    }
-
-                    if (session.phoneOutboundPlaying) {
-                        if (session.phoneOutboundBuffer.length >= frameSize) {
-                            frame = session.phoneOutboundBuffer.subarray(0, frameSize);
-                            session.phoneOutboundBuffer = Buffer.from(
-                                session.phoneOutboundBuffer.subarray(frameSize),
-                            );
-                        } else {
-                            // Sous-alimentation : on repasse en pré-tampon pour réabsorber la gigue.
-                            session.phoneOutboundBuffer = Buffer.alloc(0);
-                            session.phoneOutboundPlaying = false;
-                        }
-                    }
-                }
-
-                session.mediaSocket.sendPcm(frame);
+                session.mediaSocket.sendPcm(
+                    this.mixPhoneFrame(session, frameSize, sampleCount, silenceFrame),
+                );
             }
 
             // Resynchronise l'horloge si l'event loop a pris beaucoup de retard.
@@ -1571,23 +1647,139 @@ class CallManager {
             return;
         }
 
+        // Changement d'état du bot lui-même.
         if (newState.id === this.discordClient.user.id) {
-            if (newState.channelId !== session.voiceChannelId) {
-                await this.endCall(session, 'Le bot a été déconnecté ou déplacé du salon vocal');
+            const newChannelId = newState.channelId;
+            if (!newChannelId) {
+                // Un déplacement passe toujours directement d'un salon à l'autre ; un channelId
+                // nul correspond donc à une vraie déconnexion -> on raccroche immédiatement.
+                await this.endCall(session, 'Le bot a été déconnecté du salon vocal');
+            } else if (newChannelId !== session.voiceChannelId) {
+                await this.relocateCall(session, newChannelId);
             }
             return;
         }
 
-        if (newState.id === session.initiatorId && newState.channelId !== session.voiceChannelId) {
-            await this.endCall(session, 'L’initiateur a quitté ou changé de salon vocal');
+        // Mouvement d'un autre membre : on resynchronise les sources audio et la règle de
+        // salon vide. Aucun raccrochage immédiat lié au départ d'une personne précise.
+        this.pruneDiscordSources(session);
+        this.evaluateEmptyChannel(session);
+    }
+
+    evaluateEmptyChannel(session) {
+        const channel = session.guild.channels.cache.get(session.voiceChannelId);
+        const humanCount = channel?.isVoiceBased?.()
+            ? channel.members.filter((member) => !member.user.bot).size
+            : 0;
+
+        if (humanCount > 0) {
+            if (session.emptyChannelTimer) {
+                clearTimeout(session.emptyChannelTimer);
+                session.emptyChannelTimer = null;
+            }
             return;
         }
 
+        if (session.emptyChannelTimer) {
+            return;
+        }
+        session.emptyChannelTimer = setTimeout(() => {
+            session.emptyChannelTimer = null;
+            const current = session.guild.channels.cache.get(session.voiceChannelId);
+            const stillEmpty = !current?.isVoiceBased?.()
+                || current.members.filter((member) => !member.user.bot).size === 0;
+            if (stillEmpty) {
+                void this.endCall(session, 'Salon vocal vide depuis 60 s');
+            }
+        }, EMPTY_CHANNEL_GRACE_MS);
+    }
+
+    clearEndTimers(session) {
+        if (session.emptyChannelTimer) {
+            clearTimeout(session.emptyChannelTimer);
+            session.emptyChannelTimer = null;
+        }
+    }
+
+    async relocateCall(session, newChannelId) {
+        const newChannel = session.guild.channels.cache.get(newChannelId);
+        log('info', 'Déplacement de l’appel vers un autre salon vocal', {
+            sessionId: session.id,
+            from: session.voiceChannelId,
+            to: newChannelId,
+        });
+
+        session.voiceChannelId = newChannelId;
+        if (newChannel?.isVoiceBased?.()) {
+            session.voiceChannel = newChannel;
+        }
+
+        // Fait suivre la connexion vocale (conserve l'abonnement du lecteur téléphone -> Discord).
+        try {
+            session.voiceConnection.rejoin({ channelId: newChannelId });
+        } catch (error) {
+            log('warn', 'rejoin vocal impossible lors du déplacement', {
+                sessionId: session.id,
+                error: errorText(error),
+            });
+        }
+
+        // Les sources de l'ancien salon ne sont plus valides : réabonnement automatique à la
+        // première prise de parole dans le nouveau salon.
+        this.clearDiscordSources(session);
+
+        await this.relocateStatusMessage(session);
+        this.evaluateEmptyChannel(session);
+    }
+
+    async relocateStatusMessage(session) {
         const channel = session.guild.channels.cache.get(session.voiceChannelId);
-        if (channel?.isVoiceBased()) {
-            const humanMembers = channel.members.filter((member) => !member.user.bot);
-            if (humanMembers.size === 0) {
-                await this.endCall(session, 'Le salon vocal est vide');
+        if (!channel?.isVoiceBased?.() || typeof channel.send !== 'function') {
+            return;
+        }
+        if (session.statusChannelId === channel.id) {
+            return;
+        }
+
+        const previousMessage = session.statusMessage;
+        const previousInteraction = session.statusInteraction;
+
+        try {
+            const newMessage = await channel.send(
+                this.buildStatusPayload(
+                    session,
+                    session.statusDetail || 'Appel déplacé dans ce salon',
+                ),
+            );
+            session.statusMessage = newMessage;
+            session.statusChannelId = channel.id;
+            session.statusInteraction = null;
+        } catch (error) {
+            log('warn', 'Création du message de statut dans le nouveau salon impossible', {
+                sessionId: session.id,
+                channelId: channel.id,
+                error: errorText(error),
+            });
+            return;
+        }
+
+        try {
+            if (previousMessage?.delete) {
+                await previousMessage.delete();
+            } else if (previousInteraction) {
+                await previousInteraction.deleteReply();
+            }
+        } catch {
+            // Le jeton d'interaction a pu expirer : on tente l'autre voie de suppression.
+            try {
+                if (previousInteraction) {
+                    await previousInteraction.deleteReply();
+                }
+            } catch (error) {
+                log('warn', 'Suppression de l’ancien message de statut impossible', {
+                    sessionId: session.id,
+                    error: errorText(error),
+                });
             }
         }
     }
@@ -1601,6 +1793,7 @@ class CallManager {
         this.stopStatusRefresh(session);
         this.stopAudioDiagnostics(session);
         this.stopPhoneOutput(session);
+        this.clearEndTimers(session);
 
         if (session.callTimeoutTimer) {
             clearTimeout(session.callTimeoutTimer);
@@ -1609,9 +1802,11 @@ class CallManager {
             clearTimeout(session.maxDurationTimer);
         }
 
-        session.discordReceiveStream?.destroy();
-        session.opusDecoder?.destroy();
-        session.discordToPhoneTransform?.destroy();
+        if (session.discordSpeakingStart) {
+            session.voiceConnection?.receiver?.speaking?.off('start', session.discordSpeakingStart);
+            session.discordSpeakingStart = null;
+        }
+        this.clearDiscordSources(session);
         session.phoneToDiscordTransform?.end();
         session.phoneToDiscordStream?.end();
         session.audioSubscription?.unsubscribe();
