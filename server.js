@@ -37,8 +37,10 @@ const CREDENTIALS_FILE = process.env.ASTERISK_CREDENTIALS_FILE?.trim()
     || '/root/discord-asterisk-credentials.txt';
 const MEDIA_SUBPROTOCOL = 'media';
 const DEFAULT_MEDIA_FRAME_SIZE = 640; // slin16, 16 kHz, mono, 20 ms
-const SILENCE_KEEPALIVE_INTERVAL_MS = 20; // cadence d'envoi du silence de confort vers Asterisk
-const SILENCE_KEEPALIVE_GAP_MS = 20; // au-delà de ce délai sans audio Discord, on insère un trame de silence
+const PHONE_OUTPUT_TICK_MS = 10; // période du drainer (plus court que 20 ms pour rattraper la dérive)
+const PHONE_OUTPUT_FRAME_MS = 20; // durée audio d'une trame envoyée à Asterisk
+const PHONE_OUTPUT_JITTER_BYTES = DEFAULT_MEDIA_FRAME_SIZE * 3; // ~60 ms de pré-tampon anti-gigue
+const PHONE_OUTPUT_MAX_BYTES = DEFAULT_MEDIA_FRAME_SIZE * 25; // ~500 ms : plafond anti-latence
 const MAX_MEDIA_WS_BUFFER = 256 * 1024;
 const MAX_DISCORD_PCM_BUFFER = 3840 * 50;
 
@@ -986,8 +988,9 @@ class CallManager {
             discordRawBytes: 0,
             discordPcmBytes: 0,
             audioDiagTimer: null,
-            lastPhoneOutboundAt: 0,
-            silenceKeepaliveTimer: null,
+            phoneOutboundBuffer: Buffer.alloc(0),
+            phoneOutboundPlaying: false,
+            phoneOutputTimer: null,
         };
 
         this.sessionsByGuild.set(session.guildId, session);
@@ -1209,13 +1212,25 @@ class CallManager {
 
         session.discordToPhoneTransform.on('data', (pcm) => {
             session.discordPcmBytes += pcm.length;
-            if (!session.ending && !session.muted) {
-                session.lastPhoneOutboundAt = Date.now();
-                session.mediaSocket?.sendPcm(pcm);
+            if (session.ending || session.muted) {
+                return;
+            }
+
+            session.phoneOutboundBuffer = session.phoneOutboundBuffer.length
+                ? Buffer.concat([session.phoneOutboundBuffer, pcm])
+                : Buffer.from(pcm);
+
+            // Plafonne le tampon pour éviter l'accumulation de latence en cas de rafale.
+            if (session.phoneOutboundBuffer.length > PHONE_OUTPUT_MAX_BYTES) {
+                session.phoneOutboundBuffer = Buffer.from(
+                    session.phoneOutboundBuffer.subarray(
+                        session.phoneOutboundBuffer.length - PHONE_OUTPUT_MAX_BYTES,
+                    ),
+                );
             }
         });
 
-        this.startSilenceKeepalive(session);
+        this.startPhoneOutput(session);
 
         for (const stream of [
             session.discordReceiveStream,
@@ -1234,33 +1249,68 @@ class CallManager {
         }
     }
 
-    startSilenceKeepalive(session) {
-        this.stopSilenceKeepalive(session);
+    startPhoneOutput(session) {
+        this.stopPhoneOutput(session);
 
-        // Maintient un flux RTP continu vers Asterisk/Yeastar même quand Discord n'envoie
-        // pas d'audio. Sans cela, le Yeastar détecte un audio unidirectionnel et coupe son
-        // flux sortant (téléphone -> Discord) après quelques centaines de millisecondes.
-        const silenceFrame = Buffer.alloc(DEFAULT_MEDIA_FRAME_SIZE);
+        // Sortie unique cadencée vers Asterisk : on draine l'audio Discord depuis un tampon
+        // de gigue à un rythme temps réel (20 ms par trame) et on n'insère du silence que
+        // lors d'un vrai manque. Cela évite à la fois le hachage (silence intercalé entre les
+        // trames de parole arrivées en rafale) et la coupure du flux RTP côté Yeastar (qui
+        // détecte un audio unidirectionnel s'il ne reçoit rien en retour).
+        const frameSize = DEFAULT_MEDIA_FRAME_SIZE;
+        const silenceFrame = Buffer.alloc(frameSize);
+        let nextFrameAt = Date.now();
 
-        session.silenceKeepaliveTimer = setInterval(() => {
+        session.phoneOutputTimer = setInterval(() => {
             if (session.ending || !session.mediaSocket) {
                 return;
             }
 
-            if (Date.now() - session.lastPhoneOutboundAt < SILENCE_KEEPALIVE_GAP_MS) {
-                return;
+            const now = Date.now();
+            let guard = 0;
+
+            while (nextFrameAt <= now && guard < 6) {
+                guard += 1;
+                nextFrameAt += PHONE_OUTPUT_FRAME_MS;
+
+                let frame = silenceFrame;
+
+                if (!session.muted) {
+                    if (
+                        !session.phoneOutboundPlaying
+                        && session.phoneOutboundBuffer.length >= PHONE_OUTPUT_JITTER_BYTES
+                    ) {
+                        session.phoneOutboundPlaying = true;
+                    }
+
+                    if (session.phoneOutboundPlaying) {
+                        if (session.phoneOutboundBuffer.length >= frameSize) {
+                            frame = session.phoneOutboundBuffer.subarray(0, frameSize);
+                            session.phoneOutboundBuffer = Buffer.from(
+                                session.phoneOutboundBuffer.subarray(frameSize),
+                            );
+                        } else {
+                            // Sous-alimentation : on repasse en pré-tampon pour réabsorber la gigue.
+                            session.phoneOutboundBuffer = Buffer.alloc(0);
+                            session.phoneOutboundPlaying = false;
+                        }
+                    }
+                }
+
+                session.mediaSocket.sendPcm(frame);
             }
 
-            if (session.mediaSocket.sendPcm(silenceFrame)) {
-                session.lastPhoneOutboundAt = Date.now();
+            // Resynchronise l'horloge si l'event loop a pris beaucoup de retard.
+            if (nextFrameAt < now - 200) {
+                nextFrameAt = now;
             }
-        }, SILENCE_KEEPALIVE_INTERVAL_MS);
+        }, PHONE_OUTPUT_TICK_MS);
     }
 
-    stopSilenceKeepalive(session) {
-        if (session.silenceKeepaliveTimer) {
-            clearInterval(session.silenceKeepaliveTimer);
-            session.silenceKeepaliveTimer = null;
+    stopPhoneOutput(session) {
+        if (session.phoneOutputTimer) {
+            clearInterval(session.phoneOutputTimer);
+            session.phoneOutputTimer = null;
         }
     }
 
@@ -1550,7 +1600,7 @@ class CallManager {
         session.endedAt = Date.now();
         this.stopStatusRefresh(session);
         this.stopAudioDiagnostics(session);
-        this.stopSilenceKeepalive(session);
+        this.stopPhoneOutput(session);
 
         if (session.callTimeoutTimer) {
             clearTimeout(session.callTimeoutTimer);
